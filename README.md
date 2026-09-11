@@ -160,6 +160,15 @@ Standard [Perl::Critic::Policy](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3AP
 sub, global or constant the statement defines that nothing in the distribution
 uses, builds the distribution's index the first time it is needed.
 
+# BUGS
+
+Please report any bugs or feature requests on the bugtracker website
+[https://github.com/Troglodyne-Internet-Widgets/perl-critic-policy-prohibitunuseddefinitions/issues](https://github.com/Troglodyne-Internet-Widgets/perl-critic-policy-prohibitunuseddefinitions/issues)
+
+When submitting a bug or request, please include a test-file or a
+patch to an existing test-file that illustrates the bug or desired
+feature.
+
 # AUTHORS
 
 Current Maintainers:
