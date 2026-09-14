@@ -25,9 +25,10 @@ plainly in use gets switched off.
 
 use Test::More;
 use Test::NoWarnings;
-use File::Temp     qw{tempdir};
-use File::Path     qw{make_path};
-use File::Basename qw{dirname};
+use File::Temp       qw{tempdir};
+use File::Path       qw{make_path};
+use File::Basename   qw{dirname};
+use Test::MockModule qw{strict};
 
 use FindBin::libs;
 
@@ -118,6 +119,31 @@ subtest 'what it reports' => sub {
             'lib/Foo.pm', [ sub_unused('Foo::bar') ],
         ],
         [
+            'a hash key that spells the name',
+            { 'lib/Foo.pm' => "package Foo;\nsub bar { 1 }\nmy \$y = \$h{ bar };\n1;\n" },
+            'lib/Foo.pm', [ sub_unused('Foo::bar') ],
+        ],
+        [
+            'a string that spells the name inside an interpolated expression',
+            { 'lib/Foo.pm' => "package Foo;\nsub bar { 1 }\nprint \"\@{[ 'bar' ]}\";\n1;\n" },
+            'lib/Foo.pm', [ sub_unused('Foo::bar') ],
+        ],
+        [
+            'a string that spells the name as a braced variable',
+            { 'lib/Foo.pm' => "package Foo;\nsub bar { 1 }\nprint \"\${bar} \@{bar}\";\n1;\n" },
+            'lib/Foo.pm', [ sub_unused('Foo::bar') ],
+        ],
+        [
+            'a method call escaped inside a string',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nprint \"\\\@{[ \$obj->bar ]}\";\n" },
+            'lib/Foo.pm', [ sub_unused('Foo::bar') ],
+        ],
+        [
+            'a method call inside a string that does not interpolate',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nprint '\@{[ \$obj->bar ]}';\n" },
+            'lib/Foo.pm', [ sub_unused('Foo::bar') ],
+        ],
+        [
             'a sub in a script nothing calls',
             { 'bin/tool' => "#!/usr/bin/env perl\nsub usage { 1 }\n" },
             'bin/tool', [ sub_unused('main::usage') ],
@@ -187,6 +213,32 @@ subtest 'what it deliberately says nothing about' => sub {
         [
             'a sub called as a fully qualified method',
             { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\n\$obj->Foo::bar;\n" }, 'lib/Foo.pm',
+        ],
+        [
+            'a sub called as a method inside a hash subscript',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nmy \$y = \$h{ \$obj->bar };\n" }, 'lib/Foo.pm',
+        ],
+        [
+            'a sub called as a method inside an array subscript',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nmy \$y = \$a[ Foo->bar ];\n" }, 'lib/Foo.pm',
+        ],
+        [
+            'a sub called as a method inside a heredoc',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nprint <<\"END\";\n\@{[ \$obj->bar ]}\nEND\n" },
+            'lib/Foo.pm',
+        ],
+        [
+            'a sub called as a method inside a string, through a scalar reference',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nprint \"\${\\ \$obj->bar }\";\n" }, 'lib/Foo.pm',
+        ],
+        [
+            'a sub called as a method inside a block inside a string',
+            { 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nprint \"\@{[ map { \$_->bar } \@x ]}\";\n" },
+            'lib/Foo.pm',
+        ],
+        [
+            'a sub called inside a string by its own package',
+            { 'lib/Foo.pm' => "package Foo;\nsub bar { 1 }\nprint \"\@{[ bar() ]}\";\n1;\n" }, 'lib/Foo.pm',
         ],
         [
             'a sub exported by another package on its behalf',
@@ -323,6 +375,23 @@ subtest 'more names can be allowed, and are added to the defaults' => sub {
         [ sub_unused('Foo::bar'), global_unused('$Foo::x') ],
         'and the other way about: a qualified sub and a bare global'
     );
+};
+
+subtest 'code in a string that PPI cannot parse is skipped, not fatal' => sub {
+
+    my $root = dist( 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nprint \"\@{[ \$obj->bar ]}\";\n" );
+
+    # Built first, because building a Perl::Critic builds every installed
+    # policy, and some of those parse source from a scalar reference too.
+    my $critic = critic();
+
+    # Only a scalar reference is refused, which is how the policy hands PPI the
+    # code inside a string.  Files, the one being critiqued included, still parse.
+    my $new = PPI::Document->can('new');
+    my $ppi = Test::MockModule->new('PPI::Document');
+    $ppi->redefine( new => sub { return ref $_[1] eq 'SCALAR' ? undef : $new->(@_) } );
+
+    is_deeply( found( $root, 'lib/Foo.pm', $critic ), [ sub_unused('Foo::bar') ], 'the call it could not read is not a use' );
 };
 
 subtest 'the distribution is read once' => sub {

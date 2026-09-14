@@ -74,10 +74,16 @@ defined in a test is the test's business.
 
 =item * A call, bare or qualified: C<helper()>, C<My::Thing::helper()>.
 
-=item * A method call, C<< $obj->helper >>.  The class behind C<$obj> cannot
-be known statically, so this counts as a use of every sub named C<helper>.
+=item * A method call, C<< $obj->helper >>, wherever it is written -- a
+subscript such as C<< $h{ $obj->helper } >> included.  The class behind
+C<$obj> cannot be known statically, so this counts as a use of every sub named
+C<helper>.
 
 =item * A reference: C<\&helper>, C<&helper>, C<*helper>.
+
+=item * Any of these inside an interpolating string or heredoc, as
+C<< "@{[ $obj->helper ]}" >> or C<< "${\ helper() }" >>.  What is inside is
+read as the code it is.
 
 =item * For variables, any mention other than the declaration itself --
 C<$x>, C<$x[0]> and C<$#x> for C<@x>, C<$x{k}> for C<%x>, qualified or not,
@@ -90,7 +96,8 @@ package C<Baz> is a use of C<Baz::bar>, not of an unrelated C<Foo::bar>.
 
 A string that happens to spell a sub's name is B<not> a use, so
 C<< __PACKAGE__->can('helper') >> and C<< { list => 'do_list' } >> do not
-count.  Those are what C<allow_subs> and C<## no critic> are for.
+count, and nor do C<< "@{[ 'helper' ]}" >> or C<"${helper}">.  Those are what
+C<allow_subs> and C<## no critic> are for.
 
 =head2 EXEMPT
 
@@ -142,6 +149,10 @@ Anything reached only at runtime -- a symbolic call, a string C<eval>, an
 C<AUTOLOAD>, a dispatch table of names, C<use overload> with method names --
 reads as unused, because the source does not say otherwise.
 
+Every heredoc is read as though it interpolates, C<<< <<'END' >>> included, so a
+variable or an C<@{[ ... ]}> spelled out in a literal one still counts as a
+use.
+
 Lexical scope is not tracked.  In a package that declares C<our $x>, every
 C<$x> is read as the global, including the reads of a C<my $x> that shadows
 it.  Neither is C<our>'s habit of reaching across a later C<package> statement
@@ -189,6 +200,14 @@ Readonly::Array my @INTERPOLATING => qw{
 
 # A variable inside a string, and what follows it: "$x[0]" is a use of @x.
 Readonly::Scalar my $INTERPOLATED_RX => qr/ (?<! \\ ) ([\$\@]) \{? (\w+ (?: ::\w+ )*) \}? ([\[\{])? /x;
+
+# Code inside a string: "@{[ $obj->name ]}" and "${\ $obj->name }", braces and
+# all.  Only those two forms, because "${name}" and "@{name}" are variables.
+Readonly::Scalar my $INTERPOLATED_CODE_RX => qr/
+    (?<! \\ ) (?: \@ \{ (?= \s* \[ ) | \$ \{ (?= \s* \\ ) )
+    ( (?: [^{}]++ | (?<braces> \{ (?: [^{}]++ | (?&braces) )* \} ) )* )
+    \}
+/x;
 
 # One index per distribution root, for the life of the process.  Per process
 # rather than per policy object, so a harness that builds a new Perl::Critic
@@ -507,14 +526,18 @@ sub _word {
 
     # The sub keyword and the name being defined, not a call of it.
     return if $word->parent()->isa('PPI::Statement::Sub');
-    return if is_hash_key($word)            || is_class_name($word);
+
+    # is_hash_key calls the last word in any subscript a key, and that includes
+    # the method name in $h{ $obj->name }.
+    my $method = is_method_call($word) ? 1 : 0;
+    return if is_class_name($word)          || ( !$method && is_hash_key($word) );
     return if is_package_declaration($word) || is_included_module_name($word);
 
     my $name = $word->content();
     $name =~ s/::\z//;
     return if !length $name;
 
-    push @{ $found->{uses} }, [ q{}, $name, $pkg, $in_sub, is_method_call($word) ? 1 : 0 ];
+    push @{ $found->{uses} }, [ q{}, $name, $pkg, $in_sub, $method ];
     return;
 }
 
@@ -583,6 +606,14 @@ sub _interpolated {
         my ( $sigil, $name, $subscript ) = ( $1, $2, $3 );
         $sigil = $subscript eq '[' ? '@' : '%' if defined $subscript;
         push @{ $found->{uses} }, [ $sigil, $name, $pkg, $in_sub, 0 ];
+    }
+
+    # Parsed as the code it is, so a call in it is a call and a string in it is
+    # still only a string.
+    while ( $content =~ m/$INTERPOLATED_CODE_RX/g ) {
+        my $source = $1;
+        my $code   = PPI::Document->new( \$source ) or next;
+        _walk( $code, $pkg, $in_sub, $found );
     }
     return;
 }
