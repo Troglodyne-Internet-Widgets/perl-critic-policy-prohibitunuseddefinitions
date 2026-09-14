@@ -167,21 +167,8 @@ L<Template Toolkit|Template>, L<Mojo::Template>, L<HTML::Template> and the rest
 hand a template a hash of variables, and a key in a hash is not a sub:
 C<[% domain %]> or C<[% vhost.name %]> on plain data reaches no perl code.
 
-The exception is an object in that hash.  C<[% hv.ssh_host %]> on an object is
-a method call, and the template is the only place it is written.  So before
-removing a method this policy reports, including an accessor for a parameter
-the object is built with, search the templates for its name, as
-C<grep -rw ssh_host templates/>.  If a template calls it, it is used: keep it,
-and say why, with C<## no critic (ProhibitUnusedDefinitions)> on the sub or its
-name in C<allow_subs>.
-
-The policy does not parse templates itself.  A template cannot say whether
-C<a.b> reads a hash key or calls a method, so every such name would have to
-count as a use of every sub by that name, and a dead sub sharing a name with any
-hash key -- C<name>, C<path>, C<token> -- would never be reported.  On one
-distribution, 268 Text::Xslate TTerse templates all parsed with Xslate's own
-parser; 21 member names matched a sub in F<lib/> or F<bin/>, and every one
-checked was a hash key, not a method call.
+The exception is an object in that hash. Don't forget to search your templates
+any time you are tempted to remove code flagged in classes by this policy.
 
 =cut
 
