@@ -4,7 +4,7 @@ Perl::Critic::Policy::ProhibitUnusedDefinitions - A sub nobody calls, or a globa
 
 # VERSION
 
-version 0.001
+version 0.002
 
 # Perl::Critic::Policy::ProhibitUnusedDefinitions
 
@@ -58,9 +58,14 @@ sub DESTROY { ... }         # perl calls it
 ## WHAT COUNTS AS A USE
 
 - A call, bare or qualified: `helper()`, `My::Thing::helper()`.
-- A method call, `$obj->helper`.  The class behind `$obj` cannot
-be known statically, so this counts as a use of every sub named `helper`.
+- A method call, `$obj->helper`, wherever it is written -- a
+subscript such as `$h{ $obj->helper }` included.  The class behind
+`$obj` cannot be known statically, so this counts as a use of every sub named
+`helper`.
 - A reference: `\&helper`, `&helper`, `*helper`.
+- Any of these inside an interpolating string or heredoc, as
+`"@{[ $obj->helper ]}"` or `"${\ helper() }"`.  What is inside is
+read as the code it is.
 - For variables, any mention other than the declaration itself --
 `$x`, `$x[0]` and `$#x` for `@x`, `$x{k}` for `%x`, qualified or not,
 and inside an interpolating string or regex.
@@ -70,7 +75,8 @@ package `Baz` is a use of `Baz::bar`, not of an unrelated `Foo::bar`.
 
 A string that happens to spell a sub's name is **not** a use, so
 `__PACKAGE__->can('helper')` and `{ list => 'do_list' }` do not
-count.  Those are what `allow_subs` and `## no critic` are for.
+count, and nor do `"@{[ 'helper' ]}"` or `"${helper}"`.  Those are what
+`allow_subs` and `## no critic` are for.
 
 ## EXEMPT
 
@@ -124,10 +130,26 @@ Anything reached only at runtime -- a symbolic call, a string `eval`, an
 `AUTOLOAD`, a dispatch table of names, `use overload` with method names --
 reads as unused, because the source does not say otherwise.
 
+Every heredoc is read as though it interpolates, `<<'END'` included, so a
+variable or an `@{[ ... ]}` spelled out in a literal one still counts as a
+use.
+
 Lexical scope is not tracked.  In a package that declares `our $x`, every
 `$x` is read as the global, including the reads of a `my $x` that shadows
 it.  Neither is `our`'s habit of reaching across a later `package` statement
 in the same block, nor `${name}` written with braces outside a string.
+
+## TEMPLATES
+
+Templates are not read, so a sub called only from a template reads as unused.
+
+For most templates that costs nothing.  [Text::Xslate](https://metacpan.org/pod/Text%3A%3AXslate),
+[Template Toolkit](https://metacpan.org/pod/Template), [Mojo::Template](https://metacpan.org/pod/Mojo%3A%3ATemplate), [HTML::Template](https://metacpan.org/pod/HTML%3A%3ATemplate) and the rest
+hand a template a hash of variables, and a key in a hash is not a sub:
+`[% domain %]` or `[% vhost.name %]` on plain data reaches no perl code.
+
+The exception is an object in that hash. Don't forget to search your templates
+any time you are tempted to remove code flagged in classes by this policy.
 
 ## METHODS
 
