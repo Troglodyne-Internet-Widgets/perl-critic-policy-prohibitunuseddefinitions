@@ -7,8 +7,14 @@ runtime:
     PPI: '0'
     Readonly: '0'
     Cwd: '0'
+    Cpanel::JSON::XS: '0'
+    Digest::SHA: '0'
+    File::Path: '2.07'
+    File::Slurper: '0'
+    File::Slurper::Temp: '0'
     File::Spec: '0'
     Scalar::Util: '0'
+    Time::HiRes: '0'
 test:
   requires:
     Test::More: '0'

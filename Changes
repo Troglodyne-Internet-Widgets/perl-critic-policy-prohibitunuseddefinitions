@@ -1,5 +1,11 @@
 Revision history for Perl-Critic-Policy-ProhibitUnusedDefinitions
 
+0.003 2026-09-18 TEODESIAN
+    - Keep the index of each distribution on disk between runs, as JSON, and
+      parse again only the files whose stat changed.  An editor that starts
+      a new process for every check, such as PerlNavigator, no longer parses
+      the whole distribution each time.  New parameters: cache, cache_dir.
+
 0.002 2026-09-14 TEODESIAN
     - Fix issue with not detecting interpolated sub calls
 

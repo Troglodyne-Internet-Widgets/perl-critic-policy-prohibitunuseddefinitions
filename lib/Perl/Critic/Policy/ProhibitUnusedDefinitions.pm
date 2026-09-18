@@ -11,10 +11,16 @@ use re '/aa';
 
 use Readonly;
 
-use Cwd          ();
-use File::Spec   ();
-use PPI          ();
-use Scalar::Util ();
+use Cwd                 ();
+use Cpanel::JSON::XS    ();
+use Digest::SHA         ();
+use File::Path          ();
+use File::Slurper       ();
+use File::Slurper::Temp ();
+use File::Spec          ();
+use PPI                 ();
+use Scalar::Util        ();
+use Time::HiRes         ();
 
 use Perl::Critic::Utils qw{ :severities :classification all_perl_files };
 use parent              qw{Perl::Critic::Policy};
@@ -132,7 +138,42 @@ The same for C<our> variables, with their sigil:
     [ProhibitUnusedDefinitions]
     allow_globals = $DEBUG %My::Thing::REGISTRY
 
+=item C<cache>
+
+Whether to keep the index on disk between runs.  On by default.  See
+L</THE INDEX ON DISK>.
+
+    [ProhibitUnusedDefinitions]
+    cache = 0
+
+=item C<cache_dir>
+
+Where the index is kept.  The default is
+F<$XDG_CACHE_HOME/perl-critic-prohibitunuseddefinitions>, or
+F<~/.cache/perl-critic-prohibitunuseddefinitions> when C<XDG_CACHE_HOME> is not
+set.
+
 =back
+
+=head2 THE INDEX ON DISK
+
+An editor integration such as PerlNavigator starts a new process for every file
+that it checks.  Without a cache, every check of a file in F<bin/> or F<lib/>
+parses the whole distribution again, which takes seconds on a large one.
+
+So the index is also kept on disk, one file for each distribution, as JSON.
+For each file it holds what the file defines, exports and uses, and a stamp of
+the file: its device, inode, size, and modification and change times.  A new
+process reads the cache, compares each stamp with the file on disk, and parses
+only the files whose stamp differs.  A file that is gone drops out, and a new
+file is parsed.  The cache is written again only when something changed.
+
+The cache also records the stamp of this policy's own file.  So a new version
+of the policy, or an edit to it, starts from an empty cache.
+
+A cache that cannot be read, does not parse, or cannot be written is ignored,
+and the index is built as though there were none.  A check never fails
+because of the cache.
 
 =head2 CAVEATS
 
@@ -143,7 +184,8 @@ F<lib/> or F<bin/> the file is in.  Source with no file name -- a string handed
 to C<critique> -- belongs to no distribution and is never reported.
 
 The index is built once per distribution per process.  A file edited after it
-was built is not seen again until the next run.
+was built is not seen again in that process.  L</THE INDEX ON DISK> is how the
+next process sees it.
 
 Anything reached only at runtime -- a symbolic call, a string C<eval>, an
 C<AUTOLOAD>, a dispatch table of names, C<use overload> with method names --
@@ -223,15 +265,22 @@ Readonly::Scalar my $INTERPOLATED_CODE_RX => qr/
 
 # One index per distribution root, for the life of the process.  Per process
 # rather than per policy object, so a harness that builds a new Perl::Critic
-# for every file still parses the distribution once.
-my %INDEX_FOR;
+# for every file still parses the distribution once.  our, so that a test can
+# empty it and read the cache on disk as a new process does.
+our %INDEX_FOR;
+
+# Change it when what the cache holds for a file changes shape.
+Readonly::Scalar my $CACHE_FORMAT => 1;
+
+Readonly::Scalar my $CACHE_NAME => 'perl-critic-prohibitunuseddefinitions';
 
 =head2 METHODS
 
 =head3 supported_parameters
 
 C<allow_subs> and C<allow_globals>, the names that are never reported, added
-to the built-in lists.
+to the built-in lists.  C<cache> and C<cache_dir>, which control
+L</THE INDEX ON DISK>.
 
 =head3 initialize_if_enabled
 
@@ -267,6 +316,18 @@ sub supported_parameters {
             default_string => $DEFAULT_ALLOW_GLOBALS,
             behavior       => 'string list',
         },
+        {
+            name           => 'cache',
+            description    => 'Keep the index of each distribution on disk between runs.',
+            default_string => '1',
+            behavior       => 'boolean',
+        },
+        {
+            name           => 'cache_dir',
+            description    => 'Where the index is kept.  Empty means $XDG_CACHE_HOME, or ~/.cache, and then ' . $CACHE_NAME . q{.},
+            default_string => q{},
+            behavior       => 'string',
+        },
     );
 }
 
@@ -300,7 +361,7 @@ sub violates {
     my $definitions = $self->_definitions_in($doc)                            or return;
     my $defined     = $definitions->{by_elem}{ Scalar::Util::refaddr($elem) } or return;
 
-    my $index = $INDEX_FOR{ $definitions->{root} } //= _build_index( $definitions->{root} );
+    my $index = $INDEX_FOR{ $definitions->{root} } //= _build_index( $definitions->{root}, $self->_cache_dir() );
 
     return map { $self->violation( sprintf( $DESC_FOR{ $_->[0] }, $_->[1] ), $EXPL, $elem ) }
       grep { !$self->_is_needed( $index, @$_ ) } @$defined;
@@ -376,23 +437,49 @@ sub _dist_root {
     return $fallback;
 }
 
-# Every definition, export and use in the distribution, read once.
-sub _build_index {
-    my ($root) = @_;
+# Where the index of each distribution is kept, or undef for no cache.
+sub _cache_dir {
+    my ($self) = @_;
 
-    my ( %defined, %exported, @uses );
+    return                     if !$self->{_cache};
+    return $self->{_cache_dir} if $self->{_cache_dir};
+
+    my $base = $ENV{XDG_CACHE_HOME} || ( $ENV{HOME} && File::Spec->catdir( $ENV{HOME}, '.cache' ) ) or return;
+    return File::Spec->catdir( $base, $CACHE_NAME );
+}
+
+# Every definition, export and use in the distribution.  A file whose stamp
+# matches its entry in the cache is not parsed again.
+sub _build_index {
+    my ( $root, $cache_dir ) = @_;
+
+    my $cached = _read_cache( $root, $cache_dir );
+    my ( %defined, %exported, @uses, %walked );
+    my $changed = 0;
+
     foreach my $dir ( sort keys %AREA_OF ) {
         my $path = File::Spec->catdir( $root, $dir );
         next if !-d $path;
 
         foreach my $file ( all_perl_files($path) ) {
-            my $ppi   = PPI::Document->new($file) or next;
-            my $found = _walk_document($ppi);
-            $defined{ $_->[2] } = 1 for @{ $found->{defs} };
-            $exported{$_} = 1 for @{ $found->{exports} };
-            push @uses, map { [ $AREA_OF{$dir}, @$_ ] } @{ $found->{uses} };
+            my $stamp = _stamp($file) // next;
+            my $walk  = $cached->{$file};
+
+            if ( !_is_fresh( $walk, $stamp ) ) {
+                $walk    = _parse( $file, $stamp ) or next;
+                $changed = 1;
+            }
+
+            $walked{$file} = $walk;
+            $defined{$_}   = 1 for @{ $walk->{defs} };
+            $exported{$_}  = 1 for @{ $walk->{exports} };
+            push @uses, map { [ $AREA_OF{$dir}, @$_ ] } @{ $walk->{uses} };
         }
     }
+
+    # A file in the cache that is gone is a change too.
+    $changed ||= grep { !$walked{$_} } keys %$cached;
+    _write_cache( $root, $cache_dir, \%walked ) if $changed;
 
     # Resolved only now, because whether an unqualified bar() in package Baz
     # means Baz::bar depends on whether some other file defines one.
@@ -403,6 +490,78 @@ sub _build_index {
     }
 
     return { exported => \%exported, used => \%used };
+}
+
+# Whether a walk from the cache is whole, and was made from the file as it is.
+sub _is_fresh {
+    my ( $walk, $stamp ) = @_;
+
+    return if ref $walk ne 'HASH' || !defined $walk->{stamp} || $walk->{stamp} ne $stamp;
+    return !grep { ref $walk->{$_} ne 'ARRAY' } qw{defs exports uses};
+}
+
+# What one file defines, exports and uses, as plain data that JSON can hold,
+# or undef if PPI cannot read the file.
+sub _parse {
+    my ( $file, $stamp ) = @_;
+
+    my $ppi   = PPI::Document->new($file) or return;
+    my $found = _walk_document($ppi);
+
+    return {
+        stamp   => $stamp,
+        defs    => [ map { $_->[2] } @{ $found->{defs} } ],
+        exports => $found->{exports},
+        uses    => $found->{uses},
+    };
+}
+
+# What changes when a file does.  The inode changes when an editor saves by
+# renaming a new file over the old one, and the high-resolution times change
+# when an edit keeps the same size within one second.
+sub _stamp {
+    my ($file) = @_;
+
+    my @st = Time::HiRes::stat($file) or return;
+    return join q{:}, @st[ 0, 1, 7 ], map { sprintf '%.9f', $_ } @st[ 9, 10 ];
+}
+
+sub _cache_path {
+    my ( $root, $cache_dir ) = @_;
+    return if !defined $cache_dir;
+    return File::Spec->catfile( $cache_dir, Digest::SHA::sha1_hex($root) . '.json' );
+}
+
+# The format of the cache and the stamp of this file.  A cache made by another
+# version of the policy, or by this one before an edit, has a different key.
+sub _cache_key {
+    return join q{/}, $CACHE_FORMAT, _stamp(__FILE__) // q{};
+}
+
+# The walks in the cache for this root, keyed by file, or an empty hash.
+sub _read_cache {
+    my ( $root, $cache_dir ) = @_;
+
+    my $path = _cache_path( $root, $cache_dir ) or return {};
+
+    # A cache that is not there fails to read, like one that is unreadable.
+    my $cache = eval { Cpanel::JSON::XS->new->decode( File::Slurper::read_binary($path) ) };
+    return {} if ref $cache ne 'HASH' || ( $cache->{key} // q{} ) ne _cache_key() || ref $cache->{files} ne 'HASH';
+    return $cache->{files};
+}
+
+# Replaces the file whole, so a reader never sees half of it.  A cache that
+# cannot be written costs the next run a parse, and nothing else.
+sub _write_cache {
+    my ( $root, $cache_dir, $walked ) = @_;
+
+    my $path = _cache_path( $root, $cache_dir ) or return;
+    my $json = Cpanel::JSON::XS->new->canonical->encode( { key => _cache_key(), root => $root, files => $walked } );
+
+    File::Path::make_path( $cache_dir, { error => \my $errors } );
+    return if @$errors;
+
+    return eval { File::Slurper::Temp::write_binary( $path, $json ); 1 };
 }
 
 # A use as the walk saw it -- sigil, name, package, enclosing sub, whether it
