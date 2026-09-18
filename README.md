@@ -4,7 +4,7 @@ Perl::Critic::Policy::ProhibitUnusedDefinitions - A sub nobody calls, or a globa
 
 # VERSION
 
-version 0.003
+version 0.004
 
 # Perl::Critic::Policy::ProhibitUnusedDefinitions
 
@@ -138,15 +138,28 @@ An editor integration such as PerlNavigator starts a new process for every file
 that it checks.  Without a cache, every check of a file in `bin/` or `lib/`
 parses the whole distribution again, which takes seconds on a large one.
 
-So the index is also kept on disk, one file for each distribution, as JSON.
+So the index is also kept on disk, one file for each distribution, as JSON
+compressed with gzip.
 For each file it holds what the file defines, exports and uses, and a stamp of
 the file: its device, inode, size, and modification and change times.  A new
 process reads the cache, compares each stamp with the file on disk, and parses
 only the files whose stamp differs.  A file that is gone drops out, and a new
 file is parsed.  The cache is written again only when something changed.
 
+Each file's uses are kept resolved, too, with a digest of every definition in
+the distribution when they were resolved.  An unqualified call means a sub in
+its own package only if some file defines one, so what a use means can change
+when another file changes.  While the definitions stay the same, an unchanged
+file keeps its resolved uses, and only the changed files are resolved.  When a
+definition is added, removed or renamed, every file is resolved again.
+
 The cache also records the stamp of this policy's own file.  So a new version
 of the policy, or an edit to it, starts from an empty cache.
+
+Each time a cache is written, the cache of each distribution whose root is
+gone, such as a deleted checkout, is removed from the cache directory.  The
+root is in the gzip header of each file, so this does not read the files
+whole.
 
 A cache that cannot be read, does not parse, or cannot be written is ignored,
 and the index is built as though there were none.  A check never fails
