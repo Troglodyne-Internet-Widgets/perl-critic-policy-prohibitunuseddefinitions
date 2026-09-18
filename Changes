@@ -5,6 +5,9 @@ Revision history for Perl-Critic-Policy-ProhibitUnusedDefinitions
       parse again only the files whose stat changed.  An editor that starts
       a new process for every check, such as PerlNavigator, no longer parses
       the whole distribution each time.  New parameters: cache, cache_dir.
+    - Keep each file's uses resolved in the cache, with a digest of the
+      definitions they were resolved against.  While no definition changes,
+      only the changed files are resolved again.
 
 0.002 2026-09-14 TEODESIAN
     - Fix issue with not detecting interpolated sub calls

@@ -168,6 +168,13 @@ process reads the cache, compares each stamp with the file on disk, and parses
 only the files whose stamp differs.  A file that is gone drops out, and a new
 file is parsed.  The cache is written again only when something changed.
 
+Each file's uses are kept resolved, too, with a digest of every definition in
+the distribution when they were resolved.  An unqualified call means a sub in
+its own package only if some file defines one, so what a use means can change
+when another file changes.  While the definitions stay the same, an unchanged
+file keeps its resolved uses, and only the changed files are resolved.  When a
+definition is added, removed or renamed, every file is resolved again.
+
 The cache also records the stamp of this policy's own file.  So a new version
 of the policy, or an edit to it, starts from an empty cache.
 
@@ -270,7 +277,7 @@ Readonly::Scalar my $INTERPOLATED_CODE_RX => qr/
 our %INDEX_FOR;
 
 # Change it when what the cache holds for a file changes shape.
-Readonly::Scalar my $CACHE_FORMAT => 1;
+Readonly::Scalar my $CACHE_FORMAT => 2;
 
 Readonly::Scalar my $CACHE_NAME => 'perl-critic-prohibitunuseddefinitions';
 
@@ -449,12 +456,15 @@ sub _cache_dir {
 }
 
 # Every definition, export and use in the distribution.  A file whose stamp
-# matches its entry in the cache is not parsed again.
+# matches its entry in the cache is not parsed again, and its uses are not
+# resolved again while the set of definitions is the one they were resolved
+# against.
 sub _build_index {
     my ( $root, $cache_dir ) = @_;
 
-    my $cached = _read_cache( $root, $cache_dir );
-    my ( %defined, %exported, @uses, %walked );
+    my $cache  = _read_cache( $root, $cache_dir );
+    my $cached = $cache->{files} // {};
+    my ( %defined, %exported, @walks, %walked );
     my $changed = 0;
 
     foreach my $dir ( sort keys %AREA_OF ) {
@@ -473,21 +483,33 @@ sub _build_index {
             $walked{$file} = $walk;
             $defined{$_}   = 1 for @{ $walk->{defs} };
             $exported{$_}  = 1 for @{ $walk->{exports} };
-            push @uses, map { [ $AREA_OF{$dir}, @$_ ] } @{ $walk->{uses} };
+            push @walks, [ $AREA_OF{$dir}, $walk ];
         }
     }
 
     # A file in the cache that is gone is a change too.
     $changed ||= grep { !$walked{$_} } keys %$cached;
-    _write_cache( $root, $cache_dir, \%walked ) if $changed;
 
-    # Resolved only now, because whether an unqualified bar() in package Baz
-    # means Baz::bar depends on whether some other file defines one.
+    # Whether an unqualified bar() in package Baz means Baz::bar depends on
+    # whether some other file defines one.  So a walk resolved against the
+    # same definitions keeps its answer, and every walk is resolved again when
+    # the definitions change.
+    my $definitions = Digest::SHA::sha1_hex( join "\n", sort keys %defined );
+    my $same_defs   = ( $cache->{definitions} // q{} ) eq $definitions;
+
     my %used;
-    foreach my $use (@uses) {
-        my ( $area, @use ) = @$use;
-        $used{$area}{$_} = 1 for _resolve( \%defined, @use );
+    foreach my $area_walk (@walks) {
+        my ( $area, $walk ) = @$area_walk;
+
+        if ( !$same_defs || ref $walk->{resolved} ne 'ARRAY' ) {
+            my %keys = map { $_ => 1 } map { _resolve( \%defined, @$_ ) } @{ $walk->{uses} };
+            $walk->{resolved} = [ sort keys %keys ];
+            $changed = 1;
+        }
+        $used{$area}{$_} = 1 for @{ $walk->{resolved} };
     }
+
+    _write_cache( $root, $cache_dir, \%walked, $definitions ) if $changed;
 
     return { exported => \%exported, used => \%used };
 }
@@ -538,7 +560,9 @@ sub _cache_key {
     return join q{/}, $CACHE_FORMAT, _stamp(__FILE__) // q{};
 }
 
-# The walks in the cache for this root, keyed by file, or an empty hash.
+# The cache for this root: its walks under files, keyed by file, and the digest
+# of the definitions that their uses were resolved against.  An empty hash if
+# there is none to use.
 sub _read_cache {
     my ( $root, $cache_dir ) = @_;
 
@@ -547,16 +571,16 @@ sub _read_cache {
     # A cache that is not there fails to read, like one that is unreadable.
     my $cache = eval { Cpanel::JSON::XS->new->decode( File::Slurper::read_binary($path) ) };
     return {} if ref $cache ne 'HASH' || ( $cache->{key} // q{} ) ne _cache_key() || ref $cache->{files} ne 'HASH';
-    return $cache->{files};
+    return $cache;
 }
 
 # Replaces the file whole, so a reader never sees half of it.  A cache that
 # cannot be written costs the next run a parse, and nothing else.
 sub _write_cache {
-    my ( $root, $cache_dir, $walked ) = @_;
+    my ( $root, $cache_dir, $walked, $definitions ) = @_;
 
     my $path = _cache_path( $root, $cache_dir ) or return;
-    my $json = Cpanel::JSON::XS->new->canonical->encode( { key => _cache_key(), root => $root, files => $walked } );
+    my $json = Cpanel::JSON::XS->new->canonical->encode( { key => _cache_key(), root => $root, definitions => $definitions, files => $walked } );
 
     File::Path::make_path( $cache_dir, { error => \my $errors } );
     return if @$errors;

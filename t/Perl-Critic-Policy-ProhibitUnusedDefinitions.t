@@ -423,18 +423,22 @@ sub profile {
     return "$dir/perlcriticrc";
 }
 
-# What a new run finds for $file, and which files it parsed to find it.
+# What a new run finds for $file, which files it parsed to find it, and how
+# many uses it resolved.
 sub new_run {
     my ( $root, $file, $profile ) = @_;
 
     local %Perl::Critic::Policy::ProhibitUnusedDefinitions::INDEX_FOR;
     my @parsed;
-    my $parse = Perl::Critic::Policy::ProhibitUnusedDefinitions->can('_parse');
-    my $mock  = Test::MockModule->new('Perl::Critic::Policy::ProhibitUnusedDefinitions');
-    $mock->redefine( _parse => sub { push @parsed, $_[0] =~ s{\A\Q$root\E/}{}r; return $parse->(@_) } );
+    my $resolved = 0;
+    my $parse    = Perl::Critic::Policy::ProhibitUnusedDefinitions->can('_parse');
+    my $resolve  = Perl::Critic::Policy::ProhibitUnusedDefinitions->can('_resolve');
+    my $mock     = Test::MockModule->new('Perl::Critic::Policy::ProhibitUnusedDefinitions');
+    $mock->redefine( _parse   => sub { push @parsed, $_[0] =~ s{\A\Q$root\E/}{}r; return $parse->(@_) } );
+    $mock->redefine( _resolve => sub { $resolved++;                               return $resolve->(@_) } );
 
     my $found = found( $root, $file, critic($profile) );
-    return ( $found, [ sort @parsed ] );
+    return ( $found, [ sort @parsed ], $resolved );
 }
 
 subtest 'the index is kept on disk, and only what changed is read again' => sub {
@@ -465,6 +469,34 @@ subtest 'the index is kept on disk, and only what changed is read again' => sub 
     ( $found, $parsed ) = new_run( $root, 'lib/Foo.pm', $profile );
     is_deeply( $parsed, [],                         'a deleted file is not read' );
     is_deeply( $found,  [ sub_unused('Foo::bar') ], 'and no longer counts' );
+};
+
+subtest 'uses are resolved again only when they can mean something new' => sub {
+    my $profile = profile( cache_dir => tempdir( CLEANUP => 1 ) );
+    my $root    = dist(
+        'lib/Foo.pm' => "package Foo;\nsub run { helper(); return 1 }\n1;\n",
+        'bin/tool'   => "#!/usr/bin/env perl\nFoo::run();\nFoo::run();\n",
+    );
+
+    my ( $found, $parsed, $resolved ) = new_run( $root, 'lib/Foo.pm', $profile );
+    ok( $resolved, 'the first run resolves every use' );
+    my $all = $resolved;
+
+    ( $found, $parsed, $resolved ) = new_run( $root, 'lib/Foo.pm', $profile );
+    is( $resolved, 0, 'a run with nothing changed resolves none' );
+
+    # A change that defines nothing new: only the changed file is resolved.
+    dist_file( $root, 'bin/tool', "#!/usr/bin/env perl\nFoo::run();\n" );
+    ( $found, $parsed, $resolved ) = new_run( $root, 'lib/Foo.pm', $profile );
+    ok( $resolved > 0 && $resolved < $all, "a changed body resolves its own uses and no others ($resolved of $all)" );
+
+    # helper() in lib/Foo.pm meant nothing, because nothing defined Foo::helper.
+    # Now a new file does, and the untouched call means it.
+    make_path("$root/lib/Foo");
+    dist_file( $root, 'lib/Foo/More.pm', "package Foo;\nsub helper { 1 }\n1;\n" );
+    ( $found, $parsed, $resolved ) = new_run( $root, 'lib/Foo/More.pm', $profile );
+    is_deeply( $parsed, [qw{lib/Foo/More.pm}], 'a new definition reads only its own file' );
+    is_deeply( $found,  [],                    'but an unchanged call that now means it counts' );
 };
 
 subtest 'a cache that cannot be used is rebuilt, not trusted' => sub {
