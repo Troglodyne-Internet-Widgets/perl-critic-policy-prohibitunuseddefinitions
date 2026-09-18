@@ -4,7 +4,7 @@ Perl::Critic::Policy::ProhibitUnusedDefinitions - A sub nobody calls, or a globa
 
 # VERSION
 
-version 0.002
+version 0.003
 
 # Perl::Critic::Policy::ProhibitUnusedDefinitions
 
@@ -115,6 +115,43 @@ $VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $AUTOLOAD
     allow_globals = $DEBUG %My::Thing::REGISTRY
     ```
 
+- `cache`
+
+    Whether to keep the index on disk between runs.  On by default.  See
+    ["THE INDEX ON DISK"](#the-index-on-disk).
+
+    ```perl
+    [ProhibitUnusedDefinitions]
+    cache = 0
+    ```
+
+- `cache_dir`
+
+    Where the index is kept.  The default is
+    `$XDG_CACHE_HOME/perl-critic-prohibitunuseddefinitions`, or
+    `~/.cache/perl-critic-prohibitunuseddefinitions` when `XDG_CACHE_HOME` is not
+    set.
+
+## THE INDEX ON DISK
+
+An editor integration such as PerlNavigator starts a new process for every file
+that it checks.  Without a cache, every check of a file in `bin/` or `lib/`
+parses the whole distribution again, which takes seconds on a large one.
+
+So the index is also kept on disk, one file for each distribution, as JSON.
+For each file it holds what the file defines, exports and uses, and a stamp of
+the file: its device, inode, size, and modification and change times.  A new
+process reads the cache, compares each stamp with the file on disk, and parses
+only the files whose stamp differs.  A file that is gone drops out, and a new
+file is parsed.  The cache is written again only when something changed.
+
+The cache also records the stamp of this policy's own file.  So a new version
+of the policy, or an edit to it, starts from an empty cache.
+
+A cache that cannot be read, does not parse, or cannot be written is ignored,
+and the index is built as though there were none.  A check never fails
+because of the cache.
+
 ## CAVEATS
 
 The distribution's root is the nearest directory above the file with a
@@ -124,7 +161,8 @@ The distribution's root is the nearest directory above the file with a
 to `critique` -- belongs to no distribution and is never reported.
 
 The index is built once per distribution per process.  A file edited after it
-was built is not seen again until the next run.
+was built is not seen again in that process.  ["THE INDEX ON DISK"](#the-index-on-disk) is how the
+next process sees it.
 
 Anything reached only at runtime -- a symbolic call, a string `eval`, an
 `AUTOLOAD`, a dispatch table of names, `use overload` with method names --
@@ -156,7 +194,8 @@ any time you are tempted to remove code flagged in classes by this policy.
 ### supported\_parameters
 
 `allow_subs` and `allow_globals`, the names that are never reported, added
-to the built-in lists.
+to the built-in lists.  `cache` and `cache_dir`, which control
+["THE INDEX ON DISK"](#the-index-on-disk).
 
 ### initialize\_if\_enabled
 
