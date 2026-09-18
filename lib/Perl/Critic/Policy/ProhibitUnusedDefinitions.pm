@@ -11,16 +11,18 @@ use re '/aa';
 
 use Readonly;
 
-use Cwd                 ();
-use Cpanel::JSON::XS    ();
-use Digest::SHA         ();
-use File::Path          ();
-use File::Slurper       ();
-use File::Slurper::Temp ();
-use File::Spec          ();
-use PPI                 ();
-use Scalar::Util        ();
-use Time::HiRes         ();
+use Cwd                    ();
+use Cpanel::JSON::XS       ();
+use Digest::SHA            ();
+use File::Path             ();
+use File::Slurper          ();
+use File::Slurper::Temp    ();
+use File::Spec             ();
+use IO::Compress::Gzip     ();
+use IO::Uncompress::Gunzip ();
+use PPI                    ();
+use Scalar::Util           ();
+use Time::HiRes            ();
 
 use Perl::Critic::Utils qw{ :severities :classification all_perl_files };
 use parent              qw{Perl::Critic::Policy};
@@ -161,7 +163,8 @@ An editor integration such as PerlNavigator starts a new process for every file
 that it checks.  Without a cache, every check of a file in F<bin/> or F<lib/>
 parses the whole distribution again, which takes seconds on a large one.
 
-So the index is also kept on disk, one file for each distribution, as JSON.
+So the index is also kept on disk, one file for each distribution, as JSON
+compressed with gzip.
 For each file it holds what the file defines, exports and uses, and a stamp of
 the file: its device, inode, size, and modification and change times.  A new
 process reads the cache, compares each stamp with the file on disk, and parses
@@ -177,6 +180,11 @@ definition is added, removed or renamed, every file is resolved again.
 
 The cache also records the stamp of this policy's own file.  So a new version
 of the policy, or an edit to it, starts from an empty cache.
+
+Each time a cache is written, the cache of each distribution whose root is
+gone, such as a deleted checkout, is removed from the cache directory.  The
+root is in the gzip header of each file, so this does not read the files
+whole.
 
 A cache that cannot be read, does not parse, or cannot be written is ignored,
 and the index is built as though there were none.  A check never fails
@@ -277,9 +285,13 @@ Readonly::Scalar my $INTERPOLATED_CODE_RX => qr/
 our %INDEX_FOR;
 
 # Change it when what the cache holds for a file changes shape.
-Readonly::Scalar my $CACHE_FORMAT => 2;
+Readonly::Scalar my $CACHE_FORMAT => 3;
 
 Readonly::Scalar my $CACHE_NAME => 'perl-critic-prohibitunuseddefinitions';
+
+# What this policy names the files in its cache directory.  The .json files
+# are from before the cache was compressed.
+Readonly::Scalar my $CACHE_FILE_RX => qr/\A[0-9a-f]{40}[.]json(?:[.]gz)?\z/;
 
 =head2 METHODS
 
@@ -551,7 +563,7 @@ sub _stamp {
 sub _cache_path {
     my ( $root, $cache_dir ) = @_;
     return if !defined $cache_dir;
-    return File::Spec->catfile( $cache_dir, Digest::SHA::sha1_hex($root) . '.json' );
+    return File::Spec->catfile( $cache_dir, Digest::SHA::sha1_hex($root) . '.json.gz' );
 }
 
 # The format of the cache and the stamp of this file.  A cache made by another
@@ -569,7 +581,11 @@ sub _read_cache {
     my $path = _cache_path( $root, $cache_dir ) or return {};
 
     # A cache that is not there fails to read, like one that is unreadable.
-    my $cache = eval { Cpanel::JSON::XS->new->decode( File::Slurper::read_binary($path) ) };
+    my $cache = eval {
+        my $gz = File::Slurper::read_binary($path);
+        IO::Uncompress::Gunzip::gunzip( \$gz => \my $json ) or return;
+        Cpanel::JSON::XS->new->decode($json);
+    };
     return {} if ref $cache ne 'HASH' || ( $cache->{key} // q{} ) ne _cache_key() || ref $cache->{files} ne 'HASH';
     return $cache;
 }
@@ -582,10 +598,46 @@ sub _write_cache {
     my $path = _cache_path( $root, $cache_dir ) or return;
     my $json = Cpanel::JSON::XS->new->canonical->encode( { key => _cache_key(), root => $root, definitions => $definitions, files => $walked } );
 
+    # The root goes in the gzip header too, so that _prune_cache can read it
+    # without decompressing the file.
+    IO::Compress::Gzip::gzip( \$json => \my $gz, Comment => $root ) or return;
+
     File::Path::make_path( $cache_dir, { error => \my $errors } );
     return if @$errors;
 
-    return eval { File::Slurper::Temp::write_binary( $path, $json ); 1 };
+    my $ok = eval { File::Slurper::Temp::write_binary( $path, $gz ); 1 };
+    _prune_cache($cache_dir) if $ok;
+    return $ok;
+}
+
+# Removes the cache of each root that is gone, such as a deleted checkout, and
+# each cache from before the cache was compressed, since nothing reads them.  A
+# file whose header cannot be read is removed too, since nothing can read it
+# either.
+sub _prune_cache {
+    my ($cache_dir) = @_;
+
+    opendir( my $dh, $cache_dir ) or return;
+    my @names = grep { m/$CACHE_FILE_RX/ } readdir $dh;
+    closedir $dh;
+
+    foreach my $name (@names) {
+        my $file = File::Spec->catfile( $cache_dir, $name );
+        my $root = $name =~ m/[.]gz\z/ ? _cached_root($file) : undef;
+        next if defined $root && -d $root;
+        unlink $file;
+    }
+    return;
+}
+
+# The root that a cache file is for, from its gzip header, or undef.
+sub _cached_root {
+    my ($file) = @_;
+
+    my $z      = IO::Uncompress::Gunzip->new($file) or return;
+    my $header = $z->getHeaderInfo();
+    $z->close();
+    return ref $header eq 'HASH' ? $header->{Comment} : undef;
 }
 
 # A use as the walk saw it -- sigil, name, package, enclosing sub, whether it

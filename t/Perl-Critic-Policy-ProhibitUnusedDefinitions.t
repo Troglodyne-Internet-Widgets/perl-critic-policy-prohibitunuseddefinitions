@@ -25,10 +25,11 @@ plainly in use gets switched off.
 
 use Test::More;
 use Test::NoWarnings;
-use File::Temp       qw{tempdir};
-use File::Path       qw{make_path};
-use File::Basename   qw{dirname};
-use Test::MockModule qw{strict};
+use File::Temp         qw{tempdir};
+use File::Path         qw{make_path};
+use File::Basename     qw{dirname};
+use Test::MockModule   qw{strict};
+use IO::Compress::Gzip ();
 
 use FindBin::libs;
 
@@ -449,7 +450,11 @@ subtest 'the index is kept on disk, and only what changed is read again' => sub 
     my ( $found, $parsed ) = new_run( $root, 'lib/Foo.pm', $profile );
     is_deeply( $found,  [],                                   'called from the script' );
     is_deeply( $parsed, [qw{bin/tool lib/Baz.pm lib/Foo.pm}], 'the first run reads every file' );
-    ok( scalar( () = glob("$cache/*.json") ), 'and writes the index to cache_dir' );
+    my ($written) = glob("$cache/*.json.gz");
+    ok( $written, 'and writes the index to cache_dir' );
+    open( my $gzfh, '<:raw', $written // '/bogus' ) or die "no cache in $cache";
+    read( $gzfh, my $magic, 2 );
+    is( $magic, "\x1f\x8b", 'compressed with gzip' );
 
     ( $found, $parsed ) = new_run( $root, 'lib/Foo.pm', $profile );
     is_deeply( $found,  [], 'a second run finds the same' );
@@ -504,24 +509,55 @@ subtest 'a cache that cannot be used is rebuilt, not trusted' => sub {
     my $profile = profile( cache_dir => $cache );
     my $root    = dist( 'lib/Foo.pm' => $FOO_BAR, 'bin/tool' => "#!/usr/bin/env perl\nFoo::bar();\n" );
     new_run( $root, 'lib/Foo.pm', $profile );
-    my ($file) = glob("$cache/*.json");
+    my ($file) = glob("$cache/*.json.gz");
 
+    # The last three are compressed, so that what fails is the check of what is
+    # inside rather than the decompression.
     foreach my $case (
-        [ 'a cache that does not parse',     "{ not json" ],
-        [ 'a cache from another version',    '{"key":"0/bogus","files":{}}' ],
-        [ 'a cache with an entry cut short', '{"key":"KEY","files":{"' . "$root/bin/tool" . '":{"stamp":"STAMP"}}}' ],
+        [ 'a cache that is not gzip',        "\x1f\x8b not gzip",                                                    0 ],
+        [ 'a cache that does not parse',     "{ not json",                                                           1 ],
+        [ 'a cache from another version',    '{"key":"0/bogus","files":{}}',                                         1 ],
+        [ 'a cache with an entry cut short', '{"key":"KEY","files":{"' . "$root/bin/tool" . '":{"stamp":"STAMP"}}}', 1 ],
     ) {
-        my ( $name, $content ) = @$case;
+        my ( $name, $content, $compress ) = @$case;
         my $key   = Perl::Critic::Policy::ProhibitUnusedDefinitions::_cache_key();
         my $stamp = Perl::Critic::Policy::ProhibitUnusedDefinitions::_stamp("$root/bin/tool");
         $content =~ s/KEY/$key/;
         $content =~ s/STAMP/$stamp/;
+        IO::Compress::Gzip::gzip( \( my $plain = $content ) => \$content ) if $compress;
         dist_file( $cache, ( $file =~ s{\A\Q$cache\E/}{}r ), $content );
 
         my ( $found, $parsed ) = new_run( $root, 'lib/Foo.pm', $profile );
         ok( scalar( grep { $_ eq 'bin/tool' } @$parsed ), "$name: the file is read again" );
         is_deeply( $found, [], "$name: and the result is right" );
     }
+};
+
+subtest 'a write removes the caches of roots that are gone, and nothing else' => sub {
+    my $cache   = tempdir( CLEANUP => 1 );
+    my $profile = profile( cache_dir => $cache );
+
+    my $gone = dist( 'lib/Foo.pm' => $FOO_BAR );
+    new_run( $gone, 'lib/Foo.pm', $profile );
+    my ($gone_cache) = glob("$cache/*.json.gz");
+    File::Path::remove_tree($gone);
+
+    my $kept = dist( 'lib/Foo.pm' => $FOO_BAR );
+    new_run( $kept, 'lib/Foo.pm', $profile );
+    my ($kept_cache) = grep { $_ ne $gone_cache } glob("$cache/*.json.gz");
+
+    # A cache from before the cache was compressed, and a file that is not one
+    # of this policy's.
+    dist_file( $cache, ( 'a' x 40 ) . '.json', '{}' );
+    dist_file( $cache, 'notes.txt',            'mine' );
+
+    my $third = dist( 'lib/Foo.pm' => $FOO_BAR );
+    new_run( $third, 'lib/Foo.pm', $profile );
+
+    ok( !-e $gone_cache,                        'the cache of a root that is gone is removed' );
+    ok( -e $kept_cache,                         'the cache of a root that is there is kept' );
+    ok( !-e "$cache/" . ( 'a' x 40 ) . '.json', 'a cache from before compression is removed' );
+    ok( -e "$cache/notes.txt",                  'a file that is not a cache is left alone' );
 };
 
 subtest 'the cache can be turned off, and a cache_dir that cannot be written costs nothing' => sub {

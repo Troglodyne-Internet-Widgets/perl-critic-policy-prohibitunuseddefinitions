@@ -13,6 +13,8 @@ runtime:
     File::Slurper: '0'
     File::Slurper::Temp: '0'
     File::Spec: '0'
+    IO::Compress::Gzip: '0'
+    IO::Uncompress::Gunzip: '0'
     Scalar::Util: '0'
     Time::HiRes: '0'
 test:
