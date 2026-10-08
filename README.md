@@ -4,7 +4,7 @@ Perl::Critic::Policy::ProhibitUnusedDefinitions - A sub nobody calls, or a globa
 
 # VERSION
 
-version 0.004
+version 0.005
 
 # Perl::Critic::Policy::ProhibitUnusedDefinitions
 
@@ -14,11 +14,12 @@ somewhere, needs it.  The same goes for an `our` variable nothing reads and a
 constant nothing names.
 
 Whether anything uses a definition is not a question one file can answer, so
-this policy reads the whole distribution around the file being critiqued.  The
-first time it is asked about a file, it finds the distribution's root, parses
-everything under `bin/`, `lib/`, `t/` and `xt/` once, and notes every call
-and every reference.  Every later file in the same distribution is checked
-against that note rather than parsed again.
+this policy reads the whole distribution around the file being critiqued,
+through [Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution).  The first time it is asked about a
+file, everything under `bin/`, `lib/`, `t/` and `xt/` is parsed once, and
+every call and every reference is noted.  Every later file in the same
+distribution is checked against that note rather than parsed again.  Another
+policy that reads the distribution through the same library shares the parse.
 
 - Subs
 
@@ -127,10 +128,11 @@ $VERSION @ISA @EXPORT @EXPORT_OK %EXPORT_TAGS $AUTOLOAD
 
 - `cache_dir`
 
-    Where the index is kept.  The default is
-    `$XDG_CACHE_HOME/perl-critic-prohibitunuseddefinitions`, or
-    `~/.cache/perl-critic-prohibitunuseddefinitions` when `XDG_CACHE_HOME` is not
-    set.
+    Where the index is kept.  The default is that of
+    [Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution), `$XDG_CACHE_HOME/perl-critic-distribution`, or
+    `~/.cache/perl-critic-distribution` when `XDG_CACHE_HOME` is not set.  Give
+    every policy that reads the distribution the same one, or none, so that they
+    share a parse.
 
 ## THE INDEX ON DISK
 
@@ -138,13 +140,10 @@ An editor integration such as PerlNavigator starts a new process for every file
 that it checks.  Without a cache, every check of a file in `bin/` or `lib/`
 parses the whole distribution again, which takes seconds on a large one.
 
-So the index is also kept on disk, one file for each distribution, as JSON
-compressed with gzip.
-For each file it holds what the file defines, exports and uses, and a stamp of
-the file: its device, inode, size, and modification and change times.  A new
-process reads the cache, compares each stamp with the file on disk, and parses
-only the files whose stamp differs.  A file that is gone drops out, and a new
-file is parsed.  The cache is written again only when something changed.
+So what each file defines, exports and uses is kept on disk, by
+[Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution), whose documentation says how.  A new process
+parses only the files that changed.  A new version of this policy, or an edit
+to it, parses every file again.
 
 Each file's uses are kept resolved, too, with a digest of every definition in
 the distribution when they were resolved.  An unqualified call means a sub in
@@ -153,25 +152,14 @@ when another file changes.  While the definitions stay the same, an unchanged
 file keeps its resolved uses, and only the changed files are resolved.  When a
 definition is added, removed or renamed, every file is resolved again.
 
-The cache also records the stamp of this policy's own file.  So a new version
-of the policy, or an edit to it, starts from an empty cache.
-
-Each time a cache is written, the cache of each distribution whose root is
-gone, such as a deleted checkout, is removed from the cache directory.  The
-root is in the gzip header of each file, so this does not read the files
-whole.
-
-A cache that cannot be read, does not parse, or cannot be written is ignored,
-and the index is built as though there were none.  A check never fails
-because of the cache.
-
 ## CAVEATS
 
-The distribution's root is the nearest directory above the file with a
-`dist.ini`, `Makefile.PL`, `Build.PL`, `META.json`, `META.yml`,
-`cpanfile` or `.git` in it.  Failing that, it is the directory holding the
-`lib/` or `bin/` the file is in.  Source with no file name -- a string handed
-to `critique` -- belongs to no distribution and is never reported.
+The distribution's root is found as ["root\_of" in Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution#root_of)
+says: the nearest directory above the file with a `dist.ini`, `Makefile.PL`,
+`Build.PL`, `META.json`, `META.yml`, `cpanfile` or `.git` in it.  Only a
+file in its `lib/` or `bin/` is checked.  Source with no file name -- a
+string handed to `critique` -- belongs to no distribution and is never
+reported.
 
 The index is built once per distribution per process.  A file edited after it
 was built is not seen again in that process.  ["THE INDEX ON DISK"](#the-index-on-disk) is how the
@@ -213,7 +201,9 @@ to the built-in lists.  `cache` and `cache_dir`, which control
 ### initialize\_if\_enabled
 
 Folds the built-in exemptions back into whatever was configured, so a user's
-list adds to the defaults instead of replacing them.
+list adds to the defaults instead of replacing them.  Registers what this
+policy collects from each file with [Perl::Critic::Distribution](https://metacpan.org/pod/Perl%3A%3ACritic%3A%3ADistribution), so that it
+is collected in the same parse as what any other enabled policy needs.
 
 ### default\_severity
 
