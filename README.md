@@ -4,7 +4,7 @@ Perl::Critic::Policy::ProhibitUnusedDefinitions - A sub nobody calls, or a globa
 
 # VERSION
 
-version 0.005
+version 0.006
 
 # Perl::Critic::Policy::ProhibitUnusedDefinitions
 

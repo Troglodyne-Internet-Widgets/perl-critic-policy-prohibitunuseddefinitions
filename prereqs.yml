@@ -4,6 +4,7 @@ runtime:
     perl: '5.014'
     Perl::Critic: '1.140'
     Perl::Critic::Utils: '0'
+    Perl::Critic::Distribution: '0.002'
     PPI: '0'
     Readonly: '0'
     Cwd: '0'
