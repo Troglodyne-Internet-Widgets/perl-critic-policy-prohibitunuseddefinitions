@@ -92,6 +92,12 @@ and inside an interpolating string or regex.
 
 =back
 
+A sub calling itself is not a use of it: C<bar()> inside C<bar>, nor
+C<< $self->bar >> where C<$self> is the first argument of C<bar>, from its
+signature or from a first statement that unpacks C<shift> or C<@_>.  The same
+name on anything else is a use, so C<< $self->{inner}->bar >> and
+C<< $self->SUPER::bar >> inside C<bar> count for the other subs named C<bar>.
+
 An unqualified name is resolved to the package it appears in.  A C<bar()> in
 package C<Baz> is a use of C<Baz::bar>, not of an unrelated C<Foo::bar>.
 
@@ -464,7 +470,6 @@ sub _resolve {
     if ($method) {
         $name =~ s/\ASUPER:://;
         return _qualify( $pkg, $name ) if index( $name, '::' ) >= 0;
-        return                         if defined $in_sub && $in_sub =~ m/::\Q$name\E\z/;    # $self->same_sub
         return "->$name";
     }
 
@@ -580,9 +585,48 @@ sub _word {
     my $name = $word->content();
     $name =~ s/::\z//;
     return if !length $name;
+    return if $method && _calls_itself( $word, $name );
 
     push @{ $found->{uses} }, [ q{}, $name, $pkg, $in_sub, $method ];
     return;
+}
+
+# $self->bar inside bar, which is recursion rather than a caller.  The invocant
+# has to be the sub's own first argument, because $other->bar is a call of
+# some other object's bar, and SUPER::bar is never the sub it is written in.
+sub _calls_itself {
+    my ( $word, $name ) = @_;
+
+    my $sub = $word;
+    $sub = $sub->parent() while $sub && !$sub->isa('PPI::Statement::Sub');
+    return 0 if !$sub || ( $sub->name() =~ m/(\w+)\z/ )[0] ne $name;
+
+    my $arrow    = $word->sprevious_sibling()  or return 0;
+    my $invocant = $arrow->sprevious_sibling() or return 0;
+    return 1 if $invocant->isa('PPI::Token::Word') && $invocant->content() eq 'shift';
+    if ( $invocant->isa('PPI::Structure::Subscript') ) {
+        my $array = $invocant->sprevious_sibling();
+        return $invocant->content() eq '[0]' && $array && $array->content() eq '$_' ? 1 : 0;
+    }
+    return $invocant->isa('PPI::Token::Symbol') && $invocant->content() eq ( _first_argument($sub) // q{} ) ? 1 : 0;
+}
+
+# The name of a sub's first argument, from its signature, or from a first
+# statement that unpacks it from shift or @_.
+sub _first_argument {
+    my ($sub) = @_;
+
+    # PPI reads a signature as one where the signatures feature is on, and as a
+    # prototype elsewhere.
+    my ($signature) = grep { $_->isa('PPI::Structure::Signature') } $sub->schildren();
+    my $declared    = $signature ? $signature->content() : $sub->prototype() // q{};
+    my ($signed)    = $declared =~ m/\A[(]?\s*(\$\w+)/;
+    return $signed if $signed;
+
+    my $block      = $sub->block()     or return;
+    my $first      = $block->schild(0) or return;
+    my ($unpacked) = $first->content() =~ m/\Amy\s*[(]?\s*(\$\w+)[^=;]*=\s*(?:shift\b|\@_)/;
+    return $unpacked;
 }
 
 sub _symbol {
