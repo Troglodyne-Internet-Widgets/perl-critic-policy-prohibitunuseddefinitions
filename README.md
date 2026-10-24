@@ -4,7 +4,7 @@ Perl::Critic::Policy::ProhibitUnusedDefinitions - A sub nobody calls, or a globa
 
 # VERSION
 
-version 0.006
+version 0.007
 
 # Perl::Critic::Policy::ProhibitUnusedDefinitions
 
@@ -70,6 +70,12 @@ read as the code it is.
 - For variables, any mention other than the declaration itself --
 `$x`, `$x[0]` and `$#x` for `@x`, `$x{k}` for `%x`, qualified or not,
 and inside an interpolating string or regex.
+
+A sub calling itself is not a use of it: `bar()` inside `bar`, nor
+`$self->bar` where `$self` is the first argument of `bar`, from its
+signature or from a first statement that unpacks `shift` or `@_`.  The same
+name on anything else is a use, so `$self->{inner}->bar` and
+`$self->SUPER::bar` inside `bar` count for the other subs named `bar`.
 
 An unqualified name is resolved to the package it appears in.  A `bar()` in
 package `Baz` is a use of `Baz::bar`, not of an unrelated `Foo::bar`.
