@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!perl
 
 use 5.014;
 
@@ -29,6 +29,7 @@ use File::Temp         qw{tempdir};
 use File::Path         qw{make_path};
 use File::Basename     qw{dirname};
 use Test::MockModule   qw{strict};
+use File::Slurper      ();
 use IO::Compress::Gzip ();
 
 use FindBin::libs;
@@ -39,7 +40,10 @@ use_ok('Perl::Critic::Policy::ProhibitUnusedDefinitions');
 
 # The index on disk goes somewhere of its own, never into the cache of whoever
 # runs the tests.
-$ENV{XDG_CACHE_HOME} = tempdir( CLEANUP => 1 );
+local $ENV{XDG_CACHE_HOME} = tempdir( CLEANUP => 1 );
+
+# The two bytes a gzip file starts with.
+my $GZIP_MAGIC = pack 'C2', 0x1f, 0x8b;
 
 # -profile => q{} so Perl::Critic does not find this dist's own .perlcriticrc
 # and run every policy in it against the fixtures.
@@ -76,7 +80,11 @@ sub dist_file {
 
 sub found {
     my ( $root, $file, $critic ) = @_;
-    return [ map { $_->description() } ( $critic // critic() )->critique("$root/$file") ];
+    my @descriptions;
+    foreach my $violation ( ( $critic // critic() )->critique("$root/$file") ) {
+        push @descriptions, $violation->description();
+    }
+    return \@descriptions;
 }
 
 sub sub_unused    { return "Sub $_[0] is never called from bin/ or lib/" }
@@ -463,8 +471,8 @@ sub new_run {
     my $parse    = Perl::Critic::Policy::ProhibitUnusedDefinitions->can('_parse');
     my $resolve  = Perl::Critic::Policy::ProhibitUnusedDefinitions->can('_resolve');
     my $mock     = Test::MockModule->new('Perl::Critic::Policy::ProhibitUnusedDefinitions');
-    $mock->redefine( _parse   => sub { push @parsed, $_[1] =~ s{\A\Q$root\E/}{}r; return $parse->(@_) } );
-    $mock->redefine( _resolve => sub { $resolved++;                               return $resolve->(@_) } );
+    $mock->redefine( _parse   => sub { push @parsed, $_[1] =~ s{\A\Q$root\E/}{}rsx; return $parse->(@_) } );
+    $mock->redefine( _resolve => sub { $resolved++;                                 return $resolve->(@_) } );
 
     my $found = found( $root, $file, critic($profile) );
     return ( $found, [ sort @parsed ], $resolved );
@@ -480,9 +488,8 @@ subtest 'the index is kept on disk, and only what changed is read again' => sub 
     is_deeply( $parsed, [qw{bin/tool lib/Baz.pm lib/Foo.pm}], 'the first run reads every file' );
     my ($written) = glob("$cache/*.json.gz");
     ok( $written, 'and writes the index to cache_dir' );
-    open( my $gzfh, '<:raw', $written // '/bogus' ) or die "no cache in $cache";
-    read( $gzfh, my $magic, 2 );
-    is( $magic, "\x1f\x8b", 'compressed with gzip' );
+    my $magic = substr( File::Slurper::read_binary( $written // '/bogus' ), 0, 2 );
+    is( $magic, $GZIP_MAGIC, 'compressed with gzip' );
 
     ( $found, $parsed ) = new_run( $root, 'lib/Foo.pm', $profile );
     is_deeply( $found,  [], 'a second run finds the same' );
@@ -541,10 +548,10 @@ subtest 'a cache that cannot be used is rebuilt, not trusted' => sub {
 
     # Perl::Critic::Distribution owns the format, and its tests cover each way
     # a cache can be broken.  These two show that this policy goes through it.
-    foreach my $case ( [ 'a cache that is not gzip', "\x1f\x8b not gzip", 0 ], [ 'a cache that does not parse', "{ not json", 1 ] ) {
+    foreach my $case ( [ 'a cache that is not gzip', $GZIP_MAGIC . ' not gzip', 0 ], [ 'a cache that does not parse', "{ not json", 1 ] ) {
         my ( $name, $content, $compress ) = @$case;
         IO::Compress::Gzip::gzip( \( my $plain = $content ) => \$content ) if $compress;
-        dist_file( $cache, ( $file =~ s{\A\Q$cache\E/}{}r ), $content );
+        dist_file( $cache, ( $file =~ s{\A\Q$cache\E/}{}rsx ), $content );
 
         my ( $found, $parsed ) = new_run( $root, 'lib/Foo.pm', $profile );
         ok( scalar( grep { $_ eq 'bin/tool' } @$parsed ), "$name: the file is read again" );

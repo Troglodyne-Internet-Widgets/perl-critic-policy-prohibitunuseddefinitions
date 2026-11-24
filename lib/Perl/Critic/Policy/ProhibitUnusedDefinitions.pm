@@ -9,6 +9,9 @@ use warnings FATAL => 'all';
 
 use re '/aa';
 
+# A read through $h->{a}{b} does not create $h->{a}.
+no autovivification;
+
 use Readonly;
 
 use Digest::SHA  ();
@@ -234,8 +237,6 @@ Readonly::Scalar my $DEFAULT_ALLOW_GLOBALS => join ' ', qw{
 Readonly::Hash my %AREA_OF => ( bin => 'code', lib => 'code', t => 'test', xt => 'test' );
 Readonly::Hash my %AREAS_FOR => ( sub => [qw{code}], constant => [qw{code test}], global => [qw{code test}] );
 
-Readonly::Array my @DIST_MARKERS => qw{ dist.ini Makefile.PL Build.PL META.json META.yml cpanfile .git };
-
 Readonly::Array my @INTERPOLATING => qw{
   PPI::Token::Quote::Double
   PPI::Token::Quote::Interpolate
@@ -248,15 +249,14 @@ Readonly::Array my @INTERPOLATING => qw{
 };
 
 # A variable inside a string, and what follows it: "$x[0]" is a use of @x.
-Readonly::Scalar my $INTERPOLATED_RX => qr/ (?<! \\ ) ([\$\@]) \{? (\w+ (?: ::\w+ )*) \}? ([\[\{])? /x;
+Readonly::Scalar my $INTERPOLATED_RX => qr/ (?<! \\ ) ([\$\@]) \{? (\w+ (?: ::\w+ )*) \}? ([\[\{])? /sx;
 
 # Code inside a string: "@{[ $obj->name ]}" and "${\ $obj->name }", braces and
 # all.  Only those two forms, because "${name}" and "@{name}" are variables.
-Readonly::Scalar my $INTERPOLATED_CODE_RX => qr/
-    (?<! \\ ) (?: \@ \{ (?= \s* \[ ) | \$ \{ (?= \s* \\ ) )
-    ( (?: [^{}]++ | (?<braces> \{ (?: [^{}]++ | (?&braces) )* \} ) )* )
-    \}
-/x;
+# In three chunks, so that none of them is a pattern too long to read.
+Readonly::Scalar my $CODE_OPEN_RX         => qr{ (?<! \\ ) (?: \@ \{ (?= \s* \[ ) | \$ \{ (?= \s* \\ ) ) }sx;
+Readonly::Scalar my $CODE_BODY_RX         => qr{ ( (?: [^{}]++ | (?<braces> \{ (?: [^{}]++ | (?&braces) )* \} ) )* ) }sx;
+Readonly::Scalar my $INTERPOLATED_CODE_RX => qr{ $CODE_OPEN_RX $CODE_BODY_RX \} }sx;
 
 # One index per distribution root, for the life of the process.  Per process
 # rather than per policy object, so a harness that builds a new Perl::Critic
@@ -321,8 +321,8 @@ sub initialize_if_enabled {
     # 'string list' hands us the configured value in place of the default, and
     # somebody naming one plugin hook of their own did not mean to start
     # reporting DESTROY.
-    $self->{_allow_subs}{$_}    = 1 for split m/\s+/, $DEFAULT_ALLOW_SUBS;
-    $self->{_allow_globals}{$_} = 1 for split m/\s+/, $DEFAULT_ALLOW_GLOBALS;
+    $self->{_allow_subs}{$_}    = 1 for split m/\s+/sx, $DEFAULT_ALLOW_SUBS;
+    $self->{_allow_globals}{$_} = 1 for split m/\s+/sx, $DEFAULT_ALLOW_GLOBALS;
 
     # Through a closure, so that a test that replaces _parse is seen.
     Perl::Critic::Distribution->register(
@@ -354,8 +354,12 @@ sub violates {
 
     my $index = $INDEX_FOR{ $definitions->{root} } //= _build_index( $definitions->{dist} );
 
-    return map { $self->violation( sprintf( $DESC_FOR{ $_->[0] }, $_->[1] ), $EXPL, $elem ) }
-      grep { !$self->_is_needed( $index, @$_ ) } @$defined;
+    my @violations;
+    foreach my $definition (@$defined) {
+        next if $self->_is_needed( $index, @$definition );
+        push @violations, $self->violation( sprintf( $DESC_FOR{ $definition->[0] }, $definition->[1] ), $EXPL, $elem );
+    }
+    return @violations;
 }
 
 # What each statement in this document defines, keyed by the statement.  Kept
@@ -388,7 +392,7 @@ sub _definitions_in {
 sub _is_needed {
     my ( $self, $index, $kind, $key ) = @_;
 
-    my ( $sigil, $bare ) = $key =~ m/\A([\$\@\%]?)(?:.*::)?(\w+)\z/;
+    my ( $sigil, $bare ) = $key =~ m/\A([\$\@\%]?)(?:.*::)?(\w+)\z/sx;
     my $allow = $kind eq 'global' ? $self->{_allow_globals} : $self->{_allow_subs};
     return 1 if $allow->{$key} || $allow->{ $sigil . $bare } || $index->{exported}{$key};
 
@@ -430,12 +434,20 @@ sub _build_index {
         my $was   = $held->{$file};
 
         if ( ref $was ne 'HASH' || ( $was->{stamp} // q{} ) ne $stamp || ref $was->{keys} ne 'ARRAY' ) {
-            my %keys = map { $_ => 1 } map { _resolve( \%defined, @$_ ) } @{ $walks->{$file}{uses} };
+            my %keys;
+            foreach my $use ( @{ $walks->{$file}{uses} } ) {
+                foreach my $key ( _resolve( \%defined, $use ) ) {
+                    $keys{$key} = 1;
+                }
+            }
             $was     = { stamp => $stamp, keys => [ sort keys %keys ] };
             $changed = 1;
         }
         $resolved{$file} = $was;
-        $used{ $AREA_OF{ $dist->area_of($file) } }{$_} = 1 for @{ $was->{keys} };
+        my $area = $AREA_OF{ $dist->area_of($file) };
+        foreach my $key ( @{ $was->{keys} } ) {
+            $used{$area}{$key} = 1;
+        }
     }
 
     # A file that is gone is a change too.
@@ -461,14 +473,27 @@ sub _parse {
 # A use as the walk saw it -- sigil, name, package, enclosing sub, whether it
 # was a method call -- as the keys of whatever it could be a use of.
 sub _resolve {
-    my ( $defined, $sigil, $name, $pkg, $in_sub, $method ) = @_;
+    my ( $defined, $use ) = @_;
 
-    if ( $sigil eq '*' ) {
-        return map { _resolve( $defined, $_, $name, $pkg, $in_sub, 0 ) } ( q{}, qw{$ @ %} );
+    my ( $sigil, $name, $pkg, $in_sub ) = @$use;
+    return _key_for( $defined, $use ) if $sigil ne '*';
+
+    # A glob is every variable of that name, and the sub.
+    my @keys;
+    foreach my $each ( q{}, qw{$ @ %} ) {
+        push @keys, _key_for( $defined, [ $each, $name, $pkg, $in_sub, 0 ] );
     }
+    return @keys;
+}
+
+# One use that is not a glob, as the key of what it could be a use of.
+sub _key_for {
+    my ( $defined, $use ) = @_;
+
+    my ( $sigil, $name, $pkg, $in_sub, $method ) = @$use;
 
     if ($method) {
-        $name =~ s/\ASUPER:://;
+        $name =~ s/\ASUPER:://sx;
         return _qualify( $pkg, $name ) if index( $name, '::' ) >= 0;
         return "->$name";
     }
@@ -485,8 +510,8 @@ sub _resolve {
 sub _qualify {
     my ( $pkg, $name ) = @_;
 
-    my ( $sigil, $bare ) = $name =~ m/\A([\$\@\%]?)(.*)\z/s;
-    $bare =~ s/\A::/main::/;
+    my ( $sigil, $bare ) = $name =~ m/\A([\$\@\%]?)(.*)\z/sx;
+    $bare =~ s/\A::/main::/sx;
     return $sigil . ( index( $bare, '::' ) >= 0 ? $bare : "${pkg}::$bare" );
 }
 
@@ -539,7 +564,12 @@ sub _constant_names {
     my $first = $stmt->schild(2) or return;
     if ( $first->isa('PPI::Structure::Constructor') ) {
         my ($expr) = $first->schildren() or return;
-        return map { _literal($_) } grep { is_hash_key($_) } $expr->schildren();
+        my @names;
+        foreach my $child ( $expr->schildren() ) {
+            next if !is_hash_key($child);
+            push @names, _literal($child);
+        }
+        return @names;
     }
     return _literal($first);
 }
@@ -564,10 +594,19 @@ sub _token {
     elsif ( $token->isa('PPI::Token::ArrayIndex') ) {
         push @{ $found->{uses} }, [ '@', substr( $token->content(), 2 ), $pkg, $in_sub, 0 ];
     }
-    elsif ( grep { $token->isa($_) } @INTERPOLATING ) {
+    elsif ( _is_interpolating($token) ) {
         _interpolated( $token, $pkg, $in_sub, $found );
     }
     return;
+}
+
+sub _is_interpolating {
+    my ($token) = @_;
+
+    foreach my $class (@INTERPOLATING) {
+        return 1 if $token->isa($class);
+    }
+    return 0;
 }
 
 sub _word {
@@ -583,8 +622,8 @@ sub _word {
     return if is_package_declaration($word) || is_included_module_name($word);
 
     my $name = $word->content();
-    $name =~ s/::\z//;
-    return if !length $name;
+    $name =~ s/::\z//sx;
+    return if $name eq q{};
     return if $method && _calls_itself( $word, $name );
 
     push @{ $found->{uses} }, [ q{}, $name, $pkg, $in_sub, $method ];
@@ -599,7 +638,7 @@ sub _calls_itself {
 
     my $sub = $word;
     $sub = $sub->parent() while $sub && !$sub->isa('PPI::Statement::Sub');
-    return 0 if !$sub || ( $sub->name() =~ m/(\w+)\z/ )[0] ne $name;
+    return 0 if !$sub || ( $sub->name() =~ m/(\w+)\z/sx )[0] ne $name;
 
     my $arrow    = $word->sprevious_sibling()  or return 0;
     my $invocant = $arrow->sprevious_sibling() or return 0;
@@ -620,21 +659,21 @@ sub _first_argument {
     # prototype elsewhere.
     my ($signature) = grep { $_->isa('PPI::Structure::Signature') } $sub->schildren();
     my $declared    = $signature ? $signature->content() : $sub->prototype() // q{};
-    my ($signed)    = $declared =~ m/\A[(]?\s*(\$\w+)/;
+    my ($signed)    = $declared =~ m/\A[(]?\s*(\$\w+)/sx;
     return $signed if $signed;
 
     my $block      = $sub->block()     or return;
     my $first      = $block->schild(0) or return;
-    my ($unpacked) = $first->content() =~ m/\Amy\s*[(]?\s*(\$\w+)[^=;]*=\s*(?:shift\b|\@_)/;
+    my ($unpacked) = $first->content() =~ m/\Amy\s*[(]?\s*(\$\w+)[^=;]*=\s*(?:shift\b|\@_)/sx;
     return $unpacked;
 }
 
 sub _symbol {
     my ( $symbol, $pkg, $in_sub, $found ) = @_;
 
-    my ( $sigil, $name ) = $symbol->symbol() =~ m/\A([\$\@\%\&\*])(.+)\z/s or return;
+    my ( $sigil, $name ) = $symbol->symbol() =~ m/\A([\$\@\%\&\*])(.+)\z/sx or return;
 
-    _exports( $symbol, $name, $pkg, $found ) if $name =~ m/(?:\A|::)EXPORT(?:_OK|_TAGS)?\z/;
+    _exports( $symbol, $name, $pkg, $found ) if $name =~ m/(?:\A|::)EXPORT(?:_OK|_TAGS)?\z/sx;
     return                                   if _is_declaration($symbol);
 
     $sigil = q{} if $sigil eq '&';
@@ -646,16 +685,19 @@ sub _symbol {
 sub _exports {
     my ( $symbol, $name, $pkg, $found ) = @_;
 
-    my $owner = $name =~ m/\A(.+)::/ ? $1 : $pkg;
+    my $owner = $name =~ m/\A(.+)::/sx ? $1 : $pkg;
     my $stmt  = $symbol->statement() or return;
 
-    my @literals = (
-        map( { $_->literal() } @{ $stmt->find('PPI::Token::QuoteLike::Words') || [] } ),
-        map( { $_->string() } @{ $stmt->find('PPI::Token::Quote')             || [] } ),
-    );
+    my @literals;
+    foreach my $words ( @{ $stmt->find('PPI::Token::QuoteLike::Words') || [] } ) {
+        push @literals, $words->literal();
+    }
+    foreach my $quote ( @{ $stmt->find('PPI::Token::Quote') || [] } ) {
+        push @literals, $quote->string();
+    }
     foreach my $literal (@literals) {
-        next if $literal =~ m/\A[:-]/;    # a tag, or an Exporter option
-        $literal =~ s/\A&//;
+        next if $literal =~ m/\A[:-]/sx;    # a tag, or an Exporter option
+        $literal =~ s/\A&//sx;
         push @{ $found->{exports} }, _qualify( $owner, $literal );
     }
     return;
@@ -690,7 +732,7 @@ sub _interpolated {
     my ( $token, $pkg, $in_sub, $found ) = @_;
 
     my $content = $token->isa('PPI::Token::HereDoc') ? join( q{}, $token->heredoc() ) : $token->content();
-    while ( $content =~ m/$INTERPOLATED_RX/g ) {
+    while ( $content =~ m/$INTERPOLATED_RX/gsx ) {
         my ( $sigil, $name, $subscript ) = ( $1, $2, $3 );
         $sigil = $subscript eq '[' ? '@' : '%' if defined $subscript;
         push @{ $found->{uses} }, [ $sigil, $name, $pkg, $in_sub, 0 ];
@@ -698,7 +740,7 @@ sub _interpolated {
 
     # Parsed as the code it is, so a call in it is a call and a string in it is
     # still only a string.
-    while ( $content =~ m/$INTERPOLATED_CODE_RX/g ) {
+    while ( $content =~ m{ $INTERPOLATED_CODE_RX }gsx ) {
         my $source = $1;
         my $code   = PPI::Document->new( \$source ) or next;
         _walk( $code, $pkg, $in_sub, $found );
